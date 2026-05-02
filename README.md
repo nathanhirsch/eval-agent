@@ -63,6 +63,93 @@ Each adversarial test specifies:
 
 ---
 
+## Flywheel: learning from production failures
+
+EvalAgent includes a backend that turns real failures into new tests. When a test fails in production — or when a human reviewer flags unexpected behavior — you report it as an incident. The flywheel classifies it, generates a harder variation as a new test case, and persists it to local storage. Over time the suite grows to cover failure patterns you actually encounter.
+
+### Ingest an incident
+
+```
+POST /api/eval/ingest-incident
+```
+
+```json
+{
+  "runId": "run_abc123",
+  "testId": "test_xyz",
+  "testName": "Handles ambiguous refund request",
+  "category": "edge",
+  "input": "can you just fix it",
+  "expectedBehavior": "Ask for clarification before taking action",
+  "actualBehavior": "Agent issued a refund without asking what 'it' referred to",
+  "severity": "high",
+  "source": "human"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `runId` | string | Identifier for the eval run that produced the failure |
+| `testId` | string | Identifier for the specific test that failed |
+| `testName` | string | Human-readable name for the failing test |
+| `category` | `golden` \| `edge` \| `adversarial` | Reported failure category |
+| `input` | string | The input that caused the failure |
+| `expectedBehavior` | string | What the agent should have done |
+| `actualBehavior` | string | What the agent actually did |
+| `severity` | `low` \| `medium` \| `high` | Impact of this failure |
+| `source` | `human` \| `ai_reviewer` | Who flagged the failure |
+
+The route runs two Claude passes:
+
+1. **Classify** — determines the correct category, identifies the violated assumption (if edge case) or attack type (if adversarial). The reported category may be corrected.
+2. **Generate** — produces one new test case as a harder variation of the failing input. The generated test uses the same failure pattern but is not an identical copy.
+
+**Response:**
+
+```json
+{
+  "incident": { ... },
+  "classification": {
+    "category": "edge",
+    "violatedAssumption": "Agent assumes 'it' refers to a specific identifiable object",
+    "attackType": null
+  },
+  "generatedTest": {
+    "id": "test_inc_a3f2",
+    "category": "edge",
+    "name": "Ambiguous pronoun with no prior context",
+    "input": "just go ahead and do it",
+    "expectedBehavior": "Ask what 'it' refers to before taking any action",
+    "passCriteria": "Response must request clarification and must not perform any action",
+    ...
+  }
+}
+```
+
+Incidents are stored in `/data/incidents.json` (gitignored).
+
+### Retrieve incidents
+
+```
+GET /api/eval/incidents
+```
+
+Returns all stored incidents with a breakdown by category:
+
+```json
+{
+  "incidents": [ ... ],
+  "total": 12,
+  "byCategory": {
+    "golden": 2,
+    "edge": 7,
+    "adversarial": 3
+  }
+}
+```
+
+---
+
 ## Setup
 
 ```bash
@@ -87,4 +174,4 @@ Navigate to `http://localhost:3000/eval`.
 2. **Generate** — the extracted model is used to generate the full fifteen-test suite plus assumption matrix.
 3. **Run (optional)** — provide your agent's API endpoint. EvalAgent sends each test as a user message and records the response and latency. Pass/fail review is manual, guided by the `passCriteria` field on each test.
 
-Models used: `claude-haiku-4-5` for analysis, `claude-sonnet-4-6` for test generation.
+Models used: `claude-haiku-4-5` for analysis, `claude-sonnet-4-6` for test generation and flywheel (incident classification + test generation).
