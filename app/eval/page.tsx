@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import type { TestCase, ReviewerOutput } from '@/lib/schemas'
 
 type AnalysisResult = {
   agentPurpose: string
@@ -69,6 +70,13 @@ const CATEGORY_STYLES = {
 const INPUT_CLS = 'w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-yellow-400/60 transition-colors'
 const BTN_GOLD = 'px-5 py-2.5 rounded-lg border border-yellow-400/55 bg-yellow-500/10 text-yellow-200 text-sm font-medium hover:bg-yellow-500/15 disabled:opacity-30 disabled:cursor-not-allowed transition-colors'
 const BTN_OUTLINE = 'px-5 py-2.5 rounded-lg border border-slate-700 bg-slate-900/70 text-white text-sm font-medium hover:border-yellow-400/60 disabled:opacity-30 disabled:cursor-not-allowed transition-colors'
+const BTN_GHOST = 'px-3 py-1.5 rounded-lg border border-slate-700 text-slate-400 text-xs font-medium hover:border-slate-500 hover:text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed transition-colors'
+
+const SEVERITY_STYLES = {
+  low: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
+  medium: 'border-yellow-400/40 bg-yellow-500/10 text-yellow-300',
+  high: 'border-red-500/40 bg-red-500/10 text-red-300',
+}
 
 export default function EvalPage() {
   const [inputMode, setInputMode] = useState<'repo' | 'prompt'>('prompt')
@@ -83,6 +91,17 @@ export default function EvalPage() {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null)
   const [testSuite, setTestSuite] = useState<TestSuite | null>(null)
   const [runResults, setRunResults] = useState<RunResult[] | null>(null)
+
+  // Reviewer state
+  const [reviewerResults, setReviewerResults] = useState<Record<string, ReviewerOutput>>({})
+  const [reviewingIds, setReviewingIds] = useState<Set<string>>(new Set())
+  const [reviewingAll, setReviewingAll] = useState(false)
+
+  // Library state
+  const [library, setLibrary] = useState<TestCase[]>([])
+  const [libraryLoading, setLibraryLoading] = useState(false)
+  const [addedToLibrary, setAddedToLibrary] = useState<Set<string>>(new Set())
+  const [sentToSlack, setSentToSlack] = useState<Set<string>>(new Set())
 
   const [step, setStep] = useState<'input' | 'analyzing' | 'analyzed' | 'generating' | 'generated' | 'running' | 'done'>('input')
   const [error, setError] = useState<string | null>(null)
@@ -105,6 +124,23 @@ export default function EvalPage() {
     const id = setInterval(() => setGeneratingIdx(i => Math.min(i + 1, GENERATING_STEPS.length - 1)), 2200)
     return () => clearInterval(id)
   }, [step])
+
+  useEffect(() => {
+    if (step === 'done') loadLibrary()
+  }, [step])
+
+  async function loadLibrary() {
+    setLibraryLoading(true)
+    try {
+      const res = await fetch('/api/eval/library')
+      const data = await res.json()
+      setLibrary(data.testCases ?? [])
+    } catch {
+      // library is optional — ignore errors
+    } finally {
+      setLibraryLoading(false)
+    }
+  }
 
   async function handleAnalyze() {
     setStep('analyzing')
@@ -196,6 +232,65 @@ export default function EvalPage() {
     }
   }
 
+  async function reviewOne(runResult: RunResult, test: Test) {
+    setReviewingIds(prev => new Set(prev).add(runResult.testId))
+    try {
+      const res = await fetch('/api/eval/reviewer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ test, agentResponse: runResult.agentResponse ?? runResult.error ?? '' }),
+      })
+      const data: ReviewerOutput = await res.json()
+      if (!res.ok) throw new Error((data as any).error ?? `Server error ${res.status}`)
+      setReviewerResults(prev => ({ ...prev, [runResult.testId]: data }))
+    } catch {
+      // don't surface reviewer errors in the main error banner
+    } finally {
+      setReviewingIds(prev => { const next = new Set(prev); next.delete(runResult.testId); return next })
+    }
+  }
+
+  async function handleReviewAll() {
+    if (!runResults || !testSuite) return
+    setReviewingAll(true)
+    await Promise.allSettled(
+      runResults
+        .filter(r => !reviewerResults[r.testId])
+        .map(r => {
+          const test = testSuite.tests.find(t => t.id === r.testId)
+          return test ? reviewOne(r, test) : Promise.resolve()
+        })
+    )
+    setReviewingAll(false)
+  }
+
+  async function handleAddToLibrary(testCase: TestCase) {
+    try {
+      await fetch('/api/eval/library', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ testCase }),
+      })
+      setAddedToLibrary(prev => new Set(prev).add(testCase.id))
+      setLibrary(prev => prev.some(c => c.id === testCase.id) ? prev : [...prev, testCase])
+    } catch {
+      // silent — the user can retry
+    }
+  }
+
+  async function handleSendToSlack(testCase: TestCase, context: { testName: string; reason: string; severity: string }) {
+    try {
+      await fetch('/api/eval/slack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ testCase, context }),
+      })
+      setSentToSlack(prev => new Set(prev).add(testCase.id))
+    } catch {
+      // silent
+    }
+  }
+
   const isLoading = ['analyzing', 'generating', 'running'].includes(step)
 
   const SAMPLES = {
@@ -221,6 +316,10 @@ Always look up the order before taking any action. Never issue a refund greater 
       setRepoUrl(SAMPLES.repo.repoUrl)
     }
   }
+
+  const reviewedCount = Object.keys(reviewerResults).length
+  const failCount = Object.values(reviewerResults).filter(r => !r.passed).length
+  const proposedCount = Object.values(reviewerResults).filter(r => r.newTestCase).length
 
   return (
     <div className="min-h-screen bg-[#020617] text-slate-100" style={{ fontFamily: 'var(--font-geist-sans)' }}>
@@ -541,53 +640,250 @@ Always look up the order before taking any action. Never issue a refund greater 
           </section>
         )}
 
-        {/* Step 5: Results */}
+        {/* Step 5: Results + AI Review */}
         {runResults && (
           <section className="space-y-4">
-            <span className="text-xs text-slate-400 tracking-widest uppercase">05 — Results</span>
-            <div className="space-y-3">
-              {runResults.map(r => (
-                <div
-                  key={r.testId}
-                  className={`rounded-xl border p-5 transition-colors ${
-                    r.status === 'error'
-                      ? 'border-red-500/30 bg-red-500/5'
-                      : 'border-slate-800 bg-slate-900/60 hover:border-yellow-400/40'
-                  }`}
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400 tracking-widest uppercase">05 — Results</span>
+              <div className="flex items-center gap-3">
+                {reviewedCount > 0 && (
+                  <span className="text-xs text-slate-500">
+                    {reviewedCount}/{runResults.length} reviewed · {failCount} failed · {proposedCount} proposed
+                  </span>
+                )}
+                <button
+                  onClick={handleReviewAll}
+                  disabled={reviewingAll || reviewedCount === runResults.length}
+                  className={BTN_GOLD}
                 >
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-sm font-semibold text-white">{r.testName}</span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-slate-500 font-mono">{r.latencyMs}ms</span>
-                      <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium ${
-                        CATEGORY_STYLES[r.category as keyof typeof CATEGORY_STYLES]?.badge ?? 'border border-slate-700 bg-slate-800 text-slate-400'
-                      }`}>{r.category}</span>
-                      <span className={`text-xs px-2.5 py-0.5 rounded-full border font-medium ${
-                        r.status === 'error'
-                          ? 'border-red-500/55 bg-red-500/10 text-red-300'
-                          : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
-                      }`}>{r.status}</span>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4 text-xs">
-                    <div>
-                      <div className="text-slate-500 mb-1">Input sent</div>
-                      <div className="text-slate-300 leading-relaxed">{r.input}</div>
-                    </div>
-                    <div>
-                      <div className="text-slate-500 mb-1">Agent response</div>
-                      <div className="text-slate-300 leading-relaxed max-h-20 overflow-y-auto">
-                        {r.agentResponse || r.error || '—'}
+                  {reviewingAll ? (
+                    <span className="flex items-center gap-2">
+                      <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2.5" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                      </svg>
+                      Reviewing...
+                    </span>
+                  ) : reviewedCount === runResults.length ? 'All reviewed ✓' : 'Review All with AI →'}
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {runResults.map(r => {
+                const review = reviewerResults[r.testId]
+                const isReviewing = reviewingIds.has(r.testId)
+                const test = testSuite?.tests.find(t => t.id === r.testId)
+
+                return (
+                  <div
+                    key={r.testId}
+                    className={`rounded-xl border p-5 transition-colors ${
+                      r.status === 'error'
+                        ? 'border-red-500/30 bg-red-500/5'
+                        : review
+                          ? review.passed
+                            ? 'border-emerald-500/25 bg-emerald-500/5'
+                            : 'border-red-500/25 bg-red-500/5'
+                          : 'border-slate-800 bg-slate-900/60 hover:border-yellow-400/40'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-3">
+                      <span className="text-sm font-semibold text-white">{r.testName}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-slate-500 font-mono">{r.latencyMs}ms</span>
+                        <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium ${
+                          CATEGORY_STYLES[r.category as keyof typeof CATEGORY_STYLES]?.badge ?? 'border border-slate-700 bg-slate-800 text-slate-400'
+                        }`}>{r.category}</span>
+
+                        {/* Reviewer verdict badge */}
+                        {review ? (
+                          <span className={`text-xs px-2.5 py-0.5 rounded-full border font-medium ${
+                            review.passed
+                              ? 'border-emerald-500/55 bg-emerald-500/10 text-emerald-300'
+                              : 'border-red-500/55 bg-red-500/10 text-red-300'
+                          }`}>
+                            {review.passed ? '✓ pass' : '✗ fail'}
+                          </span>
+                        ) : r.status === 'error' ? (
+                          <span className="text-xs px-2.5 py-0.5 rounded-full border border-red-500/55 bg-red-500/10 text-red-300 font-medium">error</span>
+                        ) : isReviewing ? (
+                          <span className="text-xs px-2.5 py-0.5 rounded-full border border-slate-700 text-slate-500 font-medium flex items-center gap-1">
+                            <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2.5" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                            </svg>
+                            reviewing
+                          </span>
+                        ) : (
+                          test && (
+                            <button
+                              onClick={() => reviewOne(r, test)}
+                              className={BTN_GHOST}
+                            >
+                              Review →
+                            </button>
+                          )
+                        )}
+
+                        {review?.severity && (
+                          <span className={`text-xs px-2.5 py-0.5 rounded-full border font-medium ${SEVERITY_STYLES[review.severity]}`}>
+                            {review.severity}
+                          </span>
+                        )}
                       </div>
                     </div>
-                    <div className="col-span-2">
-                      <div className="text-slate-500 mb-1">Pass criteria (review manually)</div>
-                      <div className="text-slate-400 italic leading-relaxed">{r.passCriteria}</div>
+
+                    <div className="grid grid-cols-2 gap-4 text-xs">
+                      <div>
+                        <div className="text-slate-500 mb-1">Input sent</div>
+                        <div className="text-slate-300 leading-relaxed">{r.input}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-500 mb-1">Agent response</div>
+                        <div className="text-slate-300 leading-relaxed max-h-20 overflow-y-auto">
+                          {r.agentResponse || r.error || '—'}
+                        </div>
+                      </div>
+
+                      {review ? (
+                        <div className="col-span-2">
+                          <div className="text-slate-500 mb-1">AI reviewer verdict</div>
+                          <div className={`leading-relaxed ${review.passed ? 'text-emerald-300/80' : 'text-red-300/80'}`}>
+                            {review.reason}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="col-span-2">
+                          <div className="text-slate-500 mb-1">Pass criteria (review manually)</div>
+                          <div className="text-slate-400 italic leading-relaxed">{r.passCriteria}</div>
+                        </div>
+                      )}
                     </div>
+
+                    {/* Proposed new test case */}
+                    {review?.newTestCase && (
+                      <div className="mt-4 pt-4 border-t border-slate-700/50 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-yellow-300/70 uppercase tracking-wider">Proposed test case</span>
+                          <div className="flex items-center gap-2">
+                            {addedToLibrary.has(review.newTestCase.id) ? (
+                              <span className="text-xs text-emerald-400">Added to library ✓</span>
+                            ) : (
+                              <button
+                                onClick={() => handleAddToLibrary(review.newTestCase!)}
+                                className={BTN_GHOST}
+                              >
+                                + Add to library
+                              </button>
+                            )}
+                            {sentToSlack.has(review.newTestCase.id) ? (
+                              <span className="text-xs text-slate-500">Sent to Slack ✓</span>
+                            ) : (
+                              <button
+                                onClick={() => handleSendToSlack(review.newTestCase!, {
+                                  testName: r.testName,
+                                  reason: review.reason,
+                                  severity: review.severity ?? 'medium',
+                                })}
+                                className={BTN_GHOST}
+                              >
+                                Send to Slack ↗
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-yellow-400/20 bg-yellow-500/5 p-4 grid grid-cols-2 gap-3 text-xs">
+                          <div>
+                            <div className="text-slate-500 mb-1">Name</div>
+                            <div className="text-yellow-200/90 font-medium">{review.newTestCase.name}</div>
+                          </div>
+                          <div>
+                            <div className="text-slate-500 mb-1">Source</div>
+                            <div className="text-slate-400 font-mono">{review.newTestCase.source}</div>
+                          </div>
+                          <div>
+                            <div className="text-slate-500 mb-1">Input</div>
+                            <div className="text-slate-300 leading-relaxed">{review.newTestCase.input}</div>
+                          </div>
+                          <div>
+                            <div className="text-slate-500 mb-1">Expected behavior</div>
+                            <div className="text-slate-300 leading-relaxed">{review.newTestCase.expectedBehavior}</div>
+                          </div>
+                          {review.newTestCase.tags && review.newTestCase.tags.length > 0 && (
+                            <div className="col-span-2">
+                              <div className="text-slate-500 mb-1.5">Tags</div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {review.newTestCase.tags.map(tag => (
+                                  <span key={tag} className="px-2 py-0.5 rounded-full border border-slate-700 text-slate-400 font-mono">{tag}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
+          </section>
+        )}
+
+        {/* Test Library */}
+        {step === 'done' && (
+          <section className="space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400 tracking-widest uppercase">06 — Test library</span>
+              <button onClick={loadLibrary} disabled={libraryLoading} className={BTN_GHOST}>
+                {libraryLoading ? 'Loading...' : 'Refresh'}
+              </button>
+            </div>
+
+            {library.length === 0 ? (
+              <div className="rounded-xl border border-slate-800 bg-slate-900/40 px-6 py-8 text-center">
+                <div className="text-slate-500 text-sm">No approved test cases yet.</div>
+                <div className="text-slate-600 text-xs mt-1">Approve proposed test cases above to start building your library.</div>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-slate-800 overflow-hidden">
+                <div className="px-5 py-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+                  <span className="text-xs font-semibold text-slate-300 tracking-wide uppercase">
+                    {library.length} approved test {library.length === 1 ? 'case' : 'cases'}
+                  </span>
+                </div>
+                <div className="divide-y divide-slate-800/50">
+                  {library.map(tc => (
+                    <div key={tc.id} className="px-5 py-4 hover:bg-slate-900/40 transition-colors">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-sm font-medium text-white">{tc.name}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-400 font-mono">{tc.source}</span>
+                          <span className="text-xs text-slate-600">{new Date(tc.createdAt).toLocaleDateString()}</span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3 text-xs">
+                        <div>
+                          <div className="text-slate-500 mb-1">Input</div>
+                          <div className="text-slate-300">{tc.input}</div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500 mb-1">Expected behavior</div>
+                          <div className="text-slate-300">{tc.expectedBehavior}</div>
+                        </div>
+                      </div>
+                      {tc.tags && tc.tags.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 mt-2">
+                          {tc.tags.map(tag => (
+                            <span key={tag} className="px-2 py-0.5 rounded-full border border-slate-700 text-slate-500 text-xs font-mono">{tag}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
         )}
 

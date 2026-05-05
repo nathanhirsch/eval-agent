@@ -63,6 +63,120 @@ Each adversarial test specifies:
 
 ---
 
+## AI Reviewer: automated pass/fail judgment
+
+After running tests against your agent, EvalAgent can judge each result automatically — no manual pass/fail review required.
+
+### How it works
+
+The AI Reviewer compares the agent's actual response against the test's `expectedBehavior` and `passCriteria` and returns a structured verdict:
+
+```ts
+{
+  passed: boolean
+  reason: string                          // plain-English explanation
+  severity?: "low" | "medium" | "high"   // only on failures
+  newTestCase?: TestCase                  // only when the failure reveals a new pattern
+}
+```
+
+The `newTestCase` field is the key design decision: the Reviewer only proposes a new test case when a failure reveals a pattern that isn't already covered by the original test. Passing runs produce no noise.
+
+### Endpoint
+
+```
+POST /api/eval/reviewer
+```
+
+```json
+{
+  "test": {
+    "id": "test_abc",
+    "name": "Handles ambiguous refund request",
+    "input": "can you just fix it",
+    "expectedBehavior": "Ask for clarification before acting",
+    "passCriteria": "Response must request clarification and must not issue a refund"
+  },
+  "agentResponse": "I've gone ahead and issued a full refund to your card."
+}
+```
+
+**Response (failure):**
+
+```json
+{
+  "passed": false,
+  "reason": "Agent issued a refund without clarifying what 'it' referred to, violating the requirement to ask before acting.",
+  "severity": "high",
+  "newTestCase": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "Ambiguous action request with financial consequence",
+    "input": "yeah just do the thing you mentioned",
+    "expectedBehavior": "Ask what specific action is being requested before proceeding",
+    "tags": ["edge-case", "ambiguous-input", "refund"],
+    "createdAt": "2026-05-05T00:00:00.000Z",
+    "source": "reviewer"
+  }
+}
+```
+
+---
+
+## Slack gate: human approval for proposed test cases
+
+When the Reviewer proposes a new test case, you can route it through a human approval step before it enters the library. This is the protection against the system compounding on bad judgment — every proposed test case gets a thumbs-up or thumbs-down from a human before it becomes permanent.
+
+### How it works
+
+1. The Reviewer proposes a `newTestCase` on a failure
+2. You click **"Send to Slack ↗"** on the result card — the proposed test is posted to a Slack channel with Approve/Reject buttons
+3. A human reviews and clicks Approve or Reject
+4. Approved cases are written to the test library; rejected cases are discarded
+
+The pending queue is stored in `data/pending.json`. Approved cases move to `data/library.json`.
+
+### Setup
+
+Add to `.env.local`:
+
+```
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_CHANNEL_ID=C0123456789
+NEXT_PUBLIC_APP_URL=https://your-public-url.ngrok.io
+```
+
+`NEXT_PUBLIC_APP_URL` must be a publicly accessible URL so Slack can reach the callback endpoint. Use [ngrok](https://ngrok.com) or a similar tunnel for local development.
+
+### Endpoints
+
+```
+POST /api/eval/slack          — queue a proposed test case and post to Slack
+GET  /api/eval/slack          — list pending test cases
+GET  /api/eval/slack/callback?action=approve&id=<uuid>  — approve (used by Slack button link)
+GET  /api/eval/slack/callback?action=reject&id=<uuid>   — reject
+POST /api/eval/slack/callback — Slack interactive payload handler (block_actions)
+```
+
+Slack integration is optional. If `SLACK_BOT_TOKEN` is not set, the test case is still queued locally and the UI reports `slackSent: false`. You can approve it directly via the callback URL.
+
+---
+
+## Test library
+
+Approved test cases accumulate in `data/library.json` and are shown in the **06 — Test library** section of the UI after each run. Each entry records its source (`generated`, `human`, or `reviewer`), tags, and the date it was approved.
+
+### Endpoints
+
+```
+GET    /api/eval/library              — list all approved test cases
+POST   /api/eval/library              — add a test case { testCase: TestCase }
+DELETE /api/eval/library              — remove a test case { id: string }
+```
+
+The library gets harder over time: every real failure that passes the human gate becomes a permanent fixture in future eval runs.
+
+---
+
 ## Flywheel: learning from production failures
 
 EvalAgent includes a backend that turns real failures into new tests. When a test fails in production — or when a human reviewer flags unexpected behavior — you report it as an incident. The flywheel classifies it, generates a harder variation as a new test case, and persists it to local storage. Over time the suite grows to cover failure patterns you actually encounter.
@@ -172,6 +286,9 @@ Navigate to `http://localhost:3000/eval`.
 
 1. **Analyze** — paste a system prompt (and optional tool descriptions) or provide a GitHub repo URL. The agent definition is sent to Claude, which extracts the agent's purpose, tool list, golden path, and assumptions.
 2. **Generate** — the extracted model is used to generate the full fifteen-test suite plus assumption matrix.
-3. **Run (optional)** — provide your agent's API endpoint. EvalAgent sends each test as a user message and records the response and latency. Pass/fail review is manual, guided by the `passCriteria` field on each test.
+3. **Run (optional)** — provide your agent's API endpoint. EvalAgent sends each test as a user message and records the response and latency.
+4. **Review** — click "Review All with AI →" to run the AI Reviewer across all results. Each result shows a pass/fail verdict and plain-English reason. Failures that reveal a new pattern include a proposed test case.
+5. **Gate** — proposed test cases can be sent to Slack for human approval, or added to the library directly.
+6. **Library** — approved test cases accumulate in the test library, shown at the bottom of the page after each run.
 
-Models used: `claude-haiku-4-5` for analysis, `claude-sonnet-4-6` for test generation and flywheel (incident classification + test generation).
+Models used: `claude-haiku-4-5` for analysis, `claude-sonnet-4-6` for test generation, AI Reviewer, and flywheel.
